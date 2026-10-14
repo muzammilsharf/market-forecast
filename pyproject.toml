@@ -7,7 +7,9 @@ authors = [
     { name = "Muzammil", email = "sharfmuzamil@gmail.com" }
 ]
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "yfinance>=1.7.0",
+]
 
 [project.scripts]
 market-forecast = "market_forecast:main"
