@@ -1,2 +1,13 @@
 # virtual environment files
 .venv/
+.vscode/
+
+# Python bytecode cache
+__pycache__/
+*.pyc
+
+# Pyright / Pylance config (local editor setting)
+pyrightconfig.json
+
+# data files
+data/raw/prices.parquet
