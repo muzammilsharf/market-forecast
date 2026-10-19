@@ -104,7 +104,15 @@ def main(argv: list[str] | None = None) -> int:
 
     logger.info("=== Running Quality Checks on %s ===", PRICES_PARQUET)
     df = pd.read_parquet(PRICES_PARQUET)
-    _, reports = run_quality_checks(df)
+    clean_df, reports = run_quality_checks(df)
+    if len(clean_df) < len(df):
+        logger.info(
+            "Quality checks deduplicated dataset from %d to %d rows. Updating %s ...",
+            len(df),
+            len(clean_df),
+            PRICES_PARQUET,
+        )
+        clean_df.to_parquet(PRICES_PARQUET, index=False, engine="auto")
     summary_df = reports_to_dataframe(reports)
 
     # Filter for all tickers with any issues (both hard failures and warnings)

@@ -10,7 +10,7 @@ Checks performed on a per-ticker basis
 4.  Zero or negative prices    — open, high, low, close, adj_close > 0.
 5.  Negative volume            — volume must be >= 0.
 6.  OHLC consistency           — low <= open, close <= high for every row.
-7.  Duplicate dates            — no duplicate date entries per ticker.
+7.  Duplicate dates            — checks against data for duplicates and removes duplicate data.
 8.  Monotonic date order       — dates must be strictly increasing.
 9.  Extreme daily returns      — flags rows where |pct_change(close)| > 50 %
                                  (configurable via MAX_DAILY_RETURN_PCT).
@@ -148,13 +148,35 @@ def _check_ohlc_consistency(df: pd.DataFrame, report: QualityReport) -> None:
         )
 
 
-def _check_duplicate_dates(df: pd.DataFrame, report: QualityReport) -> None:
-    if "date" in df.columns:
-        dupes = df["date"].duplicated().sum()
+def _check_and_remove_duplicate_dates(
+    df: pd.DataFrame,
+    report: QualityReport,
+) -> pd.DataFrame:
+    """
+    Check against data for duplicate date entries.
+    If duplicate dates exist, record a warning and remove duplicates (keep latest).
+    Returns the deduplicated DataFrame slice.
+    """
+    if df.empty:
+        return df
+
+    date_col = "date" if "date" in df.columns else None
+    if date_col:
+        dupes = int(df[date_col].duplicated().sum())
+        if dupes > 0:
+            report.warn(f"Duplicate data detected: removed {dupes} duplicate date row(s).")
+            cleaned = df.drop_duplicates(subset=[date_col], keep="last").copy()
+            cleaned.sort_values(by=date_col, inplace=True)
+            cleaned.reset_index(drop=True, inplace=True)
+            return cleaned
     else:
-        dupes = df.index.duplicated().sum()
-    if dupes > 0:
-        report.fail(f"Duplicate date entries: {dupes}.")
+        dupes = int(df.index.duplicated().sum())
+        if dupes > 0:
+            report.warn(f"Duplicate data detected: removed {dupes} duplicate date row(s).")
+            cleaned = df[~df.index.duplicated(keep="last")].copy()
+            return cleaned
+
+    return df
 
 
 def _check_monotonic_index(df: pd.DataFrame, report: QualityReport) -> None:
@@ -201,6 +223,7 @@ def check_ticker(
 ) -> QualityReport:
     """
     Run all quality checks for a single ticker's DataFrame slice.
+    Checks against data and removes duplicate dates.
 
     Parameters
     ----------
@@ -220,16 +243,18 @@ def check_ticker(
     """
     report = QualityReport(ticker=ticker)
 
-    _check_minimum_rows(df, report)
-    _check_date_coverage(df, report, start_date=start_date, end_date=end_date)
-    _check_nulls(df, report)
-    _check_non_positive_prices(df, report)
-    _check_volume(df, report)
-    _check_ohlc_consistency(df, report)
-    _check_duplicate_dates(df, report)
-    _check_monotonic_index(df, report)
-    _check_extreme_returns(df, report)
-    _check_flatline(df, report)
+    # Check against data and remove duplicate dates
+    df_clean = _check_and_remove_duplicate_dates(df, report)
+
+    _check_minimum_rows(df_clean, report)
+    _check_date_coverage(df_clean, report, start_date=start_date, end_date=end_date)
+    _check_nulls(df_clean, report)
+    _check_non_positive_prices(df_clean, report)
+    _check_volume(df_clean, report)
+    _check_ohlc_consistency(df_clean, report)
+    _check_monotonic_index(df_clean, report)
+    _check_extreme_returns(df_clean, report)
+    _check_flatline(df_clean, report)
 
     return report
 
@@ -245,6 +270,7 @@ def run_quality_checks(
 ) -> tuple[pd.DataFrame, list[QualityReport]]:
     """
     Run quality checks on the full combined prices DataFrame.
+    Checks against data for duplicate rows (by ticker and date) and removes duplicate data.
 
     Parameters
     ----------
@@ -261,12 +287,26 @@ def run_quality_checks(
     Returns
     -------
     clean_df : pd.DataFrame
-        The (optionally filtered) DataFrame.
+        The deduplicated (and optionally filtered) DataFrame.
     reports : list[QualityReport]
         One QualityReport per ticker.
     """
     if "ticker" not in df.columns:
         raise ValueError("DataFrame must have a 'ticker' column.")
+
+    clean_df = df.copy()
+
+    # Check against data for duplicates and remove duplicate data
+    if "date" in clean_df.columns:
+        dupe_count = int(clean_df.duplicated(subset=["ticker", "date"]).sum())
+        if dupe_count > 0:
+            logger.info(
+                "Quality check found %d duplicate row(s) against (ticker, date). Removing duplicate data ...",
+                dupe_count,
+            )
+            clean_df.drop_duplicates(subset=["ticker", "date"], keep="last", inplace=True)
+            clean_df.sort_values(["ticker", "date"], inplace=True)
+            clean_df.reset_index(drop=True, inplace=True)
 
     reports: list[QualityReport] = []
     failed_tickers: list[str] = []
@@ -290,7 +330,6 @@ def run_quality_checks(
     passed = sum(1 for r in reports if r.passed)
     logger.info("Quality check summary: %d/%d tickers passed.", passed, total)
 
-    clean_df = df.copy()
     if drop_failed and failed_tickers:
         clean_df = clean_df[~clean_df["ticker"].isin(failed_tickers)]
         logger.info(

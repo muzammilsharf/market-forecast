@@ -10,7 +10,9 @@ from datetime import date
 # Pipeline Constants
 # ---------------------------------------------------------------------------
 START_DATE: date = date(2020, 1, 1)
-REQUEST_DELAY: int = 2          # seconds between requests
+BATCH_SIZE: int = 20            # number of tickers per primary yfinance download batch
+SMALL_BATCH_SIZE: int = 5       # fallback batch size when primary batch fails as a whole
+OVERLAP_DAYS: int = 14          # two weeks (14 days) overlap for incremental ticker fetches
 MAX_ALLOWED_FAILED: int = 10    # maximum permanently failed tickers before aborting
 
 # Canonical column name mapping (yfinance -> project standard)
