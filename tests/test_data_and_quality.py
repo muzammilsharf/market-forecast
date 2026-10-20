@@ -13,6 +13,8 @@ from market_forecast.data import (
     _extract_ticker_slice,
     _fetch_symbols_with_fallback,
     _standardise,
+    check_overlap_adjustment,
+    OverlapCheckResult,
     run_datafetch,
 )
 from market_forecast.quality import check_ticker, run_quality_checks
@@ -289,3 +291,303 @@ def test_run_datafetch_incremental_overlap_and_deduplication(tmp_path):
     overlap_date_row = aapl_saved[aapl_saved["date"] == pd.Timestamp("2024-01-10")]
     assert not overlap_date_row.empty
     assert overlap_date_row["close"].iloc[0] == 112.0
+
+
+def test_check_overlap_adjustment_unchanged():
+    dates = pd.date_range("2024-01-02", periods=10, freq="B")
+    old_df = pd.DataFrame(
+        {
+            "date": dates,
+            "ticker": "AAPL",
+            "close": np.full(10, 150.0),
+            "adj_close": np.full(10, 150.0),
+        }
+    )
+    new_df = old_df.copy()
+
+    res = check_overlap_adjustment(old_df, new_df, "AAPL")
+    assert res.adjustment_type is None
+    assert not res.is_glitch
+    assert res.ratio is None
+
+
+def test_check_overlap_adjustment_dividend():
+    dates = pd.date_range("2024-01-02", periods=10, freq="B")
+    old_df = pd.DataFrame(
+        {
+            "date": dates,
+            "ticker": "AAPL",
+            "close": np.full(10, 100.0),
+            "adj_close": np.full(10, 100.0),
+        }
+    )
+    new_df = old_df.copy()
+    # Dividend: only adj_close changed, ratio 0.95 across all overlapping dates
+    new_df["adj_close"] = 95.0
+
+    res = check_overlap_adjustment(old_df, new_df, "AAPL")
+    assert res.adjustment_type == "dividend"
+    assert not res.is_glitch
+    assert res.ratio is not None
+    assert np.isclose(res.ratio, 0.95, atol=1e-3)
+
+
+def test_check_overlap_adjustment_split():
+    dates = pd.date_range("2024-01-02", periods=10, freq="B")
+    old_df = pd.DataFrame(
+        {
+            "date": dates,
+            "ticker": "AAPL",
+            "close": np.full(10, 200.0),
+            "adj_close": np.full(10, 200.0),
+        }
+    )
+    new_df = old_df.copy()
+    # 2:1 Split: close and adj_close halved (ratio 0.5) across all overlapping dates
+    new_df["close"] = 100.0
+    new_df["adj_close"] = 100.0
+
+    res = check_overlap_adjustment(old_df, new_df, "AAPL")
+    assert res.adjustment_type == "split"
+    assert not res.is_glitch
+    assert res.ratio is not None
+    assert np.isclose(res.ratio, 0.5, atol=1e-3)
+
+
+def test_check_overlap_adjustment_irregular_data_glitch(caplog):
+    dates = pd.date_range("2024-01-02", periods=10, freq="B")
+    old_df = pd.DataFrame(
+        {
+            "date": dates,
+            "ticker": "AAPL",
+            "close": np.full(10, 100.0),
+            "adj_close": np.full(10, 100.0),
+        }
+    )
+    new_df = old_df.copy()
+    # Irregular change: day 0 has 105.0, day 1 has 95.0, rest 100.0
+    new_df.loc[0, "close"] = 105.0
+    new_df.loc[1, "close"] = 95.0
+
+    res = check_overlap_adjustment(old_df, new_df, "AAPL")
+    assert res.adjustment_type == "split"
+    assert res.is_glitch is True
+    assert res.ratio is None
+    assert any("Data glitch detected" in msg for msg in caplog.messages)
+
+
+def test_run_datafetch_overlap_unchanged_no_refetch(tmp_path):
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    parquet_path = raw_dir / "prices.parquet"
+
+    # Existing parquet with data up to 2024-01-10 for AAPL and MSFT
+    dates_hist = pd.date_range("2020-01-02", "2024-01-10", freq="B")
+    records = []
+    for sym in ["AAPL", "MSFT"]:
+        for d in dates_hist:
+            records.append(
+                {
+                    "date": d,
+                    "ticker": sym,
+                    "sector": "Technology",
+                    "open": 100.0,
+                    "high": 105.0,
+                    "low": 95.0,
+                    "close": 100.0,
+                    "adj_close": 100.0,
+                    "volume": 10000,
+                }
+            )
+    pd.DataFrame(records).to_parquet(parquet_path, index=False)
+
+    # New incremental data: overlap dates (from 2023-12-27 to 2024-01-10) are UNCHANGED (close=100, adj_close=100)
+    # Plus new dates up to 2024-01-15
+    dates_new = pd.date_range("2023-12-27", "2024-01-15", freq="B")
+    mock_raw = pd.DataFrame(
+        {
+            "Open": np.full(len(dates_new), 100.0),
+            "High": np.full(len(dates_new), 105.0),
+            "Low": np.full(len(dates_new), 95.0),
+            "Close": np.full(len(dates_new), 100.0),
+            "Adj Close": np.full(len(dates_new), 100.0),
+            "Volume": np.full(len(dates_new), 10000),
+        },
+        index=dates_new,
+    )
+
+    download_calls = []
+
+    def mock_download(symbols, start_date, end_date):
+        download_calls.append({"symbols": list(symbols), "start_date": start_date, "end_date": end_date})
+        frames = {}
+        for sym in symbols:
+            for col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
+                frames[(sym, col)] = mock_raw[col]
+        res = pd.DataFrame(frames, index=mock_raw.index)
+        res.columns = pd.MultiIndex.from_tuples(list(frames.keys()), names=["Ticker", "Price"])
+        return res
+
+    mock_tickers = [
+        {"symbol": "AAPL", "sector": "Technology"},
+        {"symbol": "MSFT", "sector": "Technology"},
+    ]
+
+    with patch("market_forecast.data.TICKERS", mock_tickers):
+        with patch("market_forecast.data._download_batch", side_effect=mock_download):
+            with patch("market_forecast.data.RAW_DATA_DIR", raw_dir):
+                with patch("market_forecast.data.PRICES_PARQUET", parquet_path):
+                    failed = run_datafetch()
+
+    assert failed == []
+    # Assert NO full refetch with start_date=START_DATE (2020-01-01) was executed!
+    for call in download_calls:
+        assert call["start_date"] != date(2020, 1, 1)
+
+
+def test_run_datafetch_overlap_adj_close_differs_only_that_ticker_refetched(tmp_path):
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    parquet_path = raw_dir / "prices.parquet"
+
+    # Existing parquet with AAPL and MSFT from 2020-01-02 to 2024-01-10
+    dates_hist = pd.date_range("2020-01-02", "2024-01-10", freq="B")
+    records = []
+    for sym in ["AAPL", "MSFT"]:
+        for d in dates_hist:
+            records.append(
+                {
+                    "date": d,
+                    "ticker": sym,
+                    "sector": "Technology",
+                    "open": 100.0,
+                    "high": 105.0,
+                    "low": 95.0,
+                    "close": 100.0,
+                    "adj_close": 100.0,
+                    "volume": 10000,
+                }
+            )
+    pd.DataFrame(records).to_parquet(parquet_path, index=False)
+
+    dates_new = pd.date_range("2023-12-27", "2024-01-15", freq="B")
+    download_history = []
+
+    def mock_download(symbols, start_date, end_date):
+        download_history.append({"symbols": list(symbols), "start_date": start_date, "end_date": end_date})
+        # If full refetch for AAPL from 2020-01-01
+        if start_date == date(2020, 1, 1):
+            dates = pd.date_range("2020-01-02", "2024-01-15", freq="B")
+            # Refetched full history has adj_close adjusted to 90.0 for dividend
+            frames = {}
+            for sym in symbols:
+                frames[(sym, "Open")] = np.full(len(dates), 100.0)
+                frames[(sym, "High")] = np.full(len(dates), 105.0)
+                frames[(sym, "Low")] = np.full(len(dates), 95.0)
+                frames[(sym, "Close")] = np.full(len(dates), 100.0)
+                frames[(sym, "Adj Close")] = np.full(len(dates), 90.0)
+                frames[(sym, "Volume")] = np.full(len(dates), 10000)
+            res = pd.DataFrame(frames, index=dates)
+            res.columns = pd.MultiIndex.from_tuples(list(frames.keys()), names=["Ticker", "Price"])
+            return res
+
+        # Normal incremental fetch
+        frames = {}
+        for sym in symbols:
+            frames[(sym, "Open")] = np.full(len(dates_new), 100.0)
+            frames[(sym, "High")] = np.full(len(dates_new), 105.0)
+            frames[(sym, "Low")] = np.full(len(dates_new), 95.0)
+            frames[(sym, "Close")] = np.full(len(dates_new), 100.0)
+            # MSFT adj_close is unchanged (100.0)
+            # AAPL adj_close changed to 90.0 (dividend across overlap)
+            adj_val = 90.0 if sym == "AAPL" else 100.0
+            frames[(sym, "Adj Close")] = np.full(len(dates_new), adj_val)
+            frames[(sym, "Volume")] = np.full(len(dates_new), 10000)
+        res = pd.DataFrame(frames, index=dates_new)
+        res.columns = pd.MultiIndex.from_tuples(list(frames.keys()), names=["Ticker", "Price"])
+        return res
+
+    mock_tickers = [
+        {"symbol": "AAPL", "sector": "Technology"},
+        {"symbol": "MSFT", "sector": "Technology"},
+    ]
+
+    with patch("market_forecast.data.TICKERS", mock_tickers):
+        with patch("market_forecast.data._download_batch", side_effect=mock_download):
+            with patch("market_forecast.data.RAW_DATA_DIR", raw_dir):
+                with patch("market_forecast.data.PRICES_PARQUET", parquet_path):
+                    failed = run_datafetch()
+
+    assert failed == []
+    # Verify: AAPL was refetched from 2020-01-01, but MSFT was NOT refetched!
+    full_refetches = [c for c in download_history if c["start_date"] == date(2020, 1, 1)]
+    assert len(full_refetches) == 1
+    assert "AAPL" in full_refetches[0]["symbols"]
+    assert "MSFT" not in full_refetches[0]["symbols"]
+
+    # In saved parquet, ALL AAPL rows have replaced adj_close = 90.0
+    saved = pd.read_parquet(parquet_path)
+    aapl_saved = saved[saved["ticker"] == "AAPL"]
+    msft_saved = saved[saved["ticker"] == "MSFT"]
+
+    assert len(aapl_saved) > 100
+    assert (aapl_saved["adj_close"] == 90.0).all()
+    # MSFT should still have old 100.0 rows preserved from 2020
+    assert (msft_saved["adj_close"] == 100.0).all()
+
+
+def test_run_datafetch_safety_valve_stops_refetch_when_too_many_triggers(tmp_path, caplog):
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    parquet_path = raw_dir / "prices.parquet"
+
+    # Create 22 tickers
+    symbols = [f"T{i}" for i in range(22)]
+    mock_tickers = [{"symbol": sym, "sector": "Tech"} for sym in symbols]
+
+    dates_hist = pd.date_range("2024-01-02", "2024-01-10", freq="B")
+    records = []
+    for sym in symbols:
+        for d in dates_hist:
+            records.append(
+                {
+                    "date": d,
+                    "ticker": sym,
+                    "sector": "Tech",
+                    "open": 100.0,
+                    "high": 105.0,
+                    "low": 95.0,
+                    "close": 100.0,
+                    "adj_close": 100.0,
+                    "volume": 10000,
+                }
+            )
+    pd.DataFrame(records).to_parquet(parquet_path, index=False)
+
+    dates_new = pd.date_range("2023-12-27", "2024-01-15", freq="B")
+    download_calls = []
+
+    def mock_download(syms, start_date, end_date):
+        download_calls.append({"symbols": list(syms), "start_date": start_date})
+        frames = {}
+        for sym in syms:
+            for col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
+                # Change adj_close to 90.0 for ALL 22 tickers -> all 22 trigger
+                val = 90.0 if col == "Adj Close" else 100.0
+                frames[(sym, col)] = np.full(len(dates_new), val)
+        res = pd.DataFrame(frames, index=dates_new)
+        res.columns = pd.MultiIndex.from_tuples(list(frames.keys()), names=["Ticker", "Price"])
+        return res
+
+    with patch("market_forecast.data.TICKERS", mock_tickers):
+        with patch("market_forecast.data._download_batch", side_effect=mock_download):
+            with patch("market_forecast.data.RAW_DATA_DIR", raw_dir):
+                with patch("market_forecast.data.PRICES_PARQUET", parquet_path):
+                    with patch("market_forecast.data.BATCH_SIZE", 25):
+                        run_datafetch(max_adjustment_threshold=20)
+
+    # Safety valve must trigger: warning logged
+    assert any("Safety valve triggered" in msg for msg in caplog.messages)
+    # NO full refetches (start_date=2020-01-01) should have been executed!
+    assert not any(c["start_date"] == date(2020, 1, 1) for c in download_calls)
+

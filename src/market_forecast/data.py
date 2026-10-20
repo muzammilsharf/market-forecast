@@ -24,7 +24,7 @@ import logging
 from collections import defaultdict
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -33,6 +33,7 @@ import yfinance as yf  # pyright: ignore[reportMissingTypeStubs]
 from market_forecast.config import (
     BATCH_SIZE,
     COLUMN_RENAME,
+    MAX_ADJUSTMENT_REFETCH_THRESHOLD,
     MAX_ALLOWED_FAILED,
     OVERLAP_DAYS,
     SMALL_BATCH_SIZE,
@@ -105,6 +106,117 @@ def _determine_ticker_start_dates(
             start_dates[symbol] = default_start_date
 
     return start_dates
+
+
+# ---------------------------------------------------------------------------
+# Overlap corporate action detection (Dividend / Split)
+# ---------------------------------------------------------------------------
+class OverlapCheckResult(NamedTuple):
+    """
+    Result of comparing overlapping dates between old and new price data.
+
+    Parameters
+    ----------
+    adjustment_type : str | None
+        'dividend' if only adj_close changed, 'split' if close changed too,
+        or None if overlap is unchanged.
+    is_glitch : bool
+        True if prices changed but the ratio of new to old is irregular across
+        the window (indicating a data glitch rather than a uniform corporate action).
+    ratio : float | None
+        The constant adjustment factor (new / old), or None if no adjustment/glitch.
+    """
+    adjustment_type: str | None
+    is_glitch: bool
+    ratio: float | None
+
+
+def check_overlap_adjustment(
+    old_df: pd.DataFrame,
+    new_df: pd.DataFrame,
+    symbol: str,
+) -> OverlapCheckResult:
+    """
+    Compare close and adj_close prices across the overlapping date window between
+    existing (old) data and newly fetched data for a ticker.
+
+    - If neither changed: unchanged overlap -> OverlapCheckResult(None, False, None).
+    - If only adj_close changed: candidate is 'dividend'.
+    - If close changed too: candidate is 'split'.
+    - If ratio of new to old is constant across the window: real adjustment.
+    - If ratio is irregular: data glitch -> OverlapCheckResult(candidate, True, None).
+    """
+    if old_df.empty or new_df.empty:
+        return OverlapCheckResult(None, False, None)
+
+    if "date" not in old_df.columns or "date" not in new_df.columns:
+        return OverlapCheckResult(None, False, None)
+
+    old_sub = old_df[old_df["ticker"] == symbol].copy() if "ticker" in old_df.columns else old_df.copy()
+    new_sub = new_df[new_df["ticker"] == symbol].copy() if "ticker" in new_df.columns else new_df.copy()
+
+    if old_sub.empty or new_sub.empty:
+        return OverlapCheckResult(None, False, None)
+
+    old_sub["date"] = pd.to_datetime(old_sub["date"]).dt.tz_localize(None)
+    new_sub["date"] = pd.to_datetime(new_sub["date"]).dt.tz_localize(None)
+
+    old_sub = old_sub.drop_duplicates(subset=["date"], keep="last")
+    new_sub = new_sub.drop_duplicates(subset=["date"], keep="last")
+
+    merged = pd.merge(
+        old_sub[["date", "close", "adj_close"]],
+        new_sub[["date", "close", "adj_close"]],
+        on="date",
+        suffixes=("_old", "_new"),
+    )
+
+    if merged.empty:
+        return OverlapCheckResult(None, False, None)
+
+    old_close = merged["close_old"].astype(float)
+    new_close = merged["close_new"].astype(float)
+    old_adj = merged["adj_close_old"].astype(float)
+    new_adj = merged["adj_close_new"].astype(float)
+
+    close_differs = ~np.isclose(old_close, new_close, rtol=1e-4, atol=1e-4)
+    adj_differs = ~np.isclose(old_adj, new_adj, rtol=1e-4, atol=1e-4)
+
+    close_changed = bool(np.any(close_differs))
+    adj_changed = bool(np.any(adj_differs))
+
+    if not close_changed and not adj_changed:
+        return OverlapCheckResult(None, False, None)
+
+    if not close_changed and adj_changed:
+        adj_type = "dividend"
+        ratio_series = new_adj / old_adj
+    else:
+        adj_type = "split"
+        ratio_series = new_close / old_close
+
+    valid_ratios = ratio_series.replace([np.inf, -np.inf], np.nan).dropna()
+    if len(valid_ratios) != len(merged) or len(valid_ratios) == 0:
+        logger.warning(
+            "Data glitch detected for %s in overlap window: non-finite prices. Skipping refetch.",
+            symbol,
+        )
+        return OverlapCheckResult(adj_type, True, None)
+
+    first_ratio = float(valid_ratios.iloc[0])
+    is_constant = bool(np.allclose(valid_ratios, first_ratio, rtol=1e-3, atol=1e-3))
+
+    if not is_constant:
+        logger.warning(
+            "Data glitch detected for %s in overlap window: %s price change ratio is irregular across window (range: [%.4f, %.4f]). Skipping refetch.",
+            symbol,
+            adj_type,
+            float(valid_ratios.min()),
+            float(valid_ratios.max()),
+        )
+        return OverlapCheckResult(adj_type, True, None)
+
+    return OverlapCheckResult(adj_type, False, first_ratio)
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +442,7 @@ def run_datafetch(
     batch_size: int = BATCH_SIZE,
     small_batch_size: int = SMALL_BATCH_SIZE,
     overlap_days: int = OVERLAP_DAYS,
+    max_adjustment_threshold: int = MAX_ADJUSTMENT_REFETCH_THRESHOLD,
 ) -> list[str]:
     """
     Full data-fetch pipeline:
@@ -342,6 +455,15 @@ def run_datafetch(
         and if that fails, fall back to single-ticker fetch
       - apply basic checks for null rows on each ticker slice
       - retry failed tickers using the same adaptive fallback
+      - inspect the 14-day overlap window between existing and new data:
+        * compare close and adj_close:
+          - if only adj_close changed -> dividend
+          - if close changed too -> split
+          - if ratio of new to old is constant across window -> real adjustment
+          - if irregular -> data glitch (log warning, do not refetch)
+        * action: refetch ticker's full history, replace all rows, log ticker and type
+        * safety valve: if >= max_adjustment_threshold tickers trigger (default 20),
+          stop and warn instead of rewriting half the file
       - merge with existing data, sort, and deduplicate overlapping records
       - abort if permanently failed tickers exceed max_allowed_failed
       - export concatenated DataFrame to Parquet
@@ -362,6 +484,9 @@ def run_datafetch(
         Fallback batch size when a primary batch fails as a whole (default: 5).
     overlap_days : int
         Days of overlap to fetch against each ticker's last fetch date (default: 14).
+    max_adjustment_threshold : int
+        Safety valve threshold: maximum corporate action adjustments allowed before
+        stopping refetch to avoid rewriting half the file (default: 20).
 
     Returns
     -------
@@ -500,6 +625,88 @@ def run_datafetch(
             )
         else:
             logger.info("All previously-failed tickers recovered on retry.")
+
+    # ------------------------------------------------------------------ #
+    # Overlap Corporate Action Check & Full History Refetch
+    # ------------------------------------------------------------------ #
+    successful_by_ticker: dict[str, pd.DataFrame] = {}
+    for df_item in successful:
+        if not df_item.empty and "ticker" in df_item.columns:
+            sym = str(df_item["ticker"].iloc[0])
+            successful_by_ticker[sym] = df_item
+
+    adjustments_to_refetch: list[tuple[str, str, str, float]] = []
+
+    if not existing_df.empty and "ticker" in existing_df.columns:
+        ticker_info_map = {t["symbol"]: t for t in TICKERS}
+        for symbol, new_slice in successful_by_ticker.items():
+            if symbol not in existing_df["ticker"].values:
+                continue
+            old_slice = existing_df[existing_df["ticker"] == symbol]
+            check_res = check_overlap_adjustment(old_slice, new_slice, symbol)
+            if check_res.adjustment_type is not None and not check_res.is_glitch and check_res.ratio is not None:
+                sector = ticker_info_map.get(symbol, {}).get("sector", "Unknown")
+                logger.info(
+                    "Detected %s for %s in overlap window (ratio: %.4f).",
+                    check_res.adjustment_type,
+                    symbol,
+                    check_res.ratio,
+                )
+                adjustments_to_refetch.append(
+                    (symbol, sector, check_res.adjustment_type, check_res.ratio)
+                )
+
+    # Safety valve: if unusual number of tickers trigger at once (say 20+),
+    # something's wrong with the source, so stop and warn instead of rewriting half your file.
+    if len(adjustments_to_refetch) >= max_adjustment_threshold:
+        logger.warning(
+            "Safety valve triggered: %d tickers triggered corporate action refetch "
+            "(threshold: %d). Something's wrong with the source, so stopping refetch "
+            "instead of rewriting half your file.",
+            len(adjustments_to_refetch),
+            max_adjustment_threshold,
+        )
+        adjustments_to_refetch = []
+    elif adjustments_to_refetch:
+        symbols_to_refetch = [item[0] for item in adjustments_to_refetch]
+        logger.info(
+            "Refetching full history from %s to %s for %d ticker(s) with corporate action adjustments: %s",
+            start_date,
+            end_date,
+            len(symbols_to_refetch),
+            symbols_to_refetch,
+        )
+        refetch_results = _fetch_symbols_with_fallback(
+            symbols_to_refetch,
+            start_date=start_date,
+            end_date=end_date,
+            small_batch_size=small_batch_size,
+        )
+        for symbol, sector, adj_type, ratio in adjustments_to_refetch:
+            ticker_df = refetch_results.get(symbol, pd.DataFrame())
+            if ticker_df.empty:
+                logger.error("Full history refetch failed for %s.", symbol)
+                permanently_failed.append(symbol)
+                successful_by_ticker.pop(symbol, None)
+            else:
+                try:
+                    full_std = _standardise(ticker_df, symbol, sector)
+                    # Action: refetch that ticker's full history, replace all its rows, and log the ticker and the type
+                    existing_df = existing_df[existing_df["ticker"] != symbol]
+                    successful_by_ticker[symbol] = full_std
+                    logger.info(
+                        "Action: refetched %s full history (type=%s, ratio=%.4f), replaced all %d rows.",
+                        symbol,
+                        adj_type,
+                        ratio,
+                        len(full_std),
+                    )
+                except Exception as exc:
+                    logger.error("Standardisation failed for full refetch of %s: %s", symbol, exc)
+                    permanently_failed.append(symbol)
+                    successful_by_ticker.pop(symbol, None)
+
+    successful = [df for sym, df in successful_by_ticker.items() if sym not in permanently_failed]
 
     # ------------------------------------------------------------------ #
     # Failure threshold gatekeep

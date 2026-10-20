@@ -14,6 +14,7 @@ BATCH_SIZE: int = 20            # number of tickers per primary yfinance downloa
 SMALL_BATCH_SIZE: int = 5       # fallback batch size when primary batch fails as a whole
 OVERLAP_DAYS: int = 14          # two weeks (14 days) overlap for incremental ticker fetches
 MAX_ALLOWED_FAILED: int = 10    # maximum permanently failed tickers before aborting
+MAX_ADJUSTMENT_REFETCH_THRESHOLD: int = 20  # safety valve: max corporate action adjustments before aborting full refetches
 
 # Canonical column name mapping (yfinance -> project standard)
 COLUMN_RENAME: dict[str, str] = {
